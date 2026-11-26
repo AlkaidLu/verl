@@ -16,9 +16,14 @@ import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
+import torch
 from omegaconf import OmegaConf
 
+from verl.protocol import DataProto
+from verl.trainer.ppo.core_algos import AdvantageEstimator
+from verl.trainer.ppo.trainer_utils import compute_advantage
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, apply_greedy_sampling_params
 
@@ -42,12 +47,17 @@ class _CustomSampler:
         self.kwargs = kwargs
 
 
-def _trainer_with_filter_groups(filter_groups: dict, trainer_mode: str = "sync") -> _StubTrainer:
+def _trainer_with_filter_groups(
+    filter_groups: dict, trainer_mode: str = "sync", algorithm_overrides: dict | None = None
+) -> _StubTrainer:
     trainer = _StubTrainer.__new__(_StubTrainer)
     trainer.trainer_mode = trainer_mode
+    algorithm = {"filter_groups": filter_groups}
+    if algorithm_overrides is not None:
+        algorithm.update(algorithm_overrides)
     trainer.config = OmegaConf.create(
         {
-            "algorithm": {"filter_groups": filter_groups},
+            "algorithm": algorithm,
             "data": {"train_batch_size": 64, "gen_batch_size": 8},
             "reward": {"reward_model": {"enable": False, "enable_resource_pool": False}},
             "trainer": {
@@ -97,6 +107,88 @@ def test_custom_sampler_skips_builtin_filter_groups_validation():
     assert "gen_batch_size" not in sampler.kwargs
     assert "max_inflight_gen_batches" not in sampler.kwargs
     assert "sync_refill_failed_groups" not in sampler.kwargs
+    assert "gdpo_config" not in sampler.kwargs
+
+
+@pytest.mark.parametrize("trainer_mode", ["sync", "colocate_async", "separate_async"])
+def test_builtin_gdpo_filter_forwards_only_gdpo_config(trainer_mode):
+    trainer = _trainer_with_filter_groups(
+        {"enable": True, "metric": "gdpo"},
+        trainer_mode=trainer_mode,
+        algorithm_overrides={
+            "adv_estimator": "gdpo",
+            "gdpo_reward_keys": ["format_reward", "accuracy_reward"],
+            "gdpo_reward_weights": [0.25, 1.5],
+            "norm_adv_by_std_in_grpo": True,
+        },
+    )
+
+    sampler = trainer._build_replay_buffer()
+
+    assert sampler.filter_groups_metric == "gdpo"
+    assert sampler.gdpo_config == {
+        "gdpo_reward_keys": ["format_reward", "accuracy_reward"],
+        "gdpo_reward_weights": [0.25, 1.5],
+        "norm_adv_by_std_in_grpo": True,
+    }
+
+
+def test_builtin_gdpo_filter_requires_gdpo_advantage_estimator():
+    trainer = _trainer_with_filter_groups(
+        {"enable": True, "metric": "gdpo"},
+        algorithm_overrides={"gdpo_reward_keys": ["format_reward"]},
+    )
+
+    with pytest.raises(ValueError, match="requires algorithm.adv_estimator"):
+        trainer._build_replay_buffer()
+
+
+def test_builtin_gdpo_filter_rejects_normoff_until_advantage_caller_fix():
+    trainer = _trainer_with_filter_groups(
+        {"enable": True, "metric": "gdpo"},
+        algorithm_overrides={
+            "adv_estimator": "gdpo",
+            "gdpo_reward_keys": ["format_reward"],
+            "norm_adv_by_std_in_grpo": False,
+        },
+    )
+
+    with pytest.raises(ValueError, match="requires norm_adv_by_std_in_grpo=True"):
+        trainer._build_replay_buffer()
+
+
+def test_gdpo_filter_matches_actual_advantage_caller_for_default_norm():
+    values = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    data = DataProto.from_dict(
+        tensors={
+            "token_level_rewards": torch.zeros((4, 2), dtype=torch.float32),
+            "response_mask": torch.ones((4, 2), dtype=torch.float32),
+            "prompts": torch.ones((4, 1), dtype=torch.long),
+            "attention_mask": torch.ones((4, 2), dtype=torch.long),
+        },
+        non_tensors={
+            "uid": np.array(["group"] * 4, dtype=object),
+            "component_a": values[:, 0],
+            "component_b": values[:, 1],
+            "component_c": values[:, 2],
+        },
+    )
+    config = {
+        "gdpo_reward_keys": ["component_a", "component_b", "component_c"],
+        "gdpo_reward_weights": [1.0, 1.0, 1.0],
+    }
+
+    result = compute_advantage(data, adv_estimator=AdvantageEstimator.GDPO, config=config)
+
+    assert torch.sign(result.batch["advantages"][:, 0]).tolist() == [1.0, 1.0, -1.0, -1.0]
 
 
 @pytest.mark.parametrize("trainer_mode", ["sync", "colocate_async", "separate_async"])

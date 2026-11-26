@@ -90,6 +90,8 @@ algorithm:
     enable: False
 
     # "reward" selects canonical pre-KL rm_scores; other names like "acc" select a reward_extra_info field.
+    # "gdpo" applies per-component GDPO normalization and weighted aggregation before batch whitening;
+    # the current built-in V1 filter requires norm_adv_by_std_in_grpo=True (see verl #8754).
     metric: reward
 
     # Maximum number of generation batches; non-positive values mean no upper limit

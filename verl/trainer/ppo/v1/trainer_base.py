@@ -71,7 +71,12 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_teacher_policy,
 )
-from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.replay_buffer import (
+    DAPO_FILTERED_REWARD_COUNTS_KEY,
+    FILTER_GROUPS_GDPO_METRIC,
+    ReplayBuffer,
+    ReplayBufferAsync,
+)
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -184,6 +189,8 @@ class PPOTrainer(ABC):
                 sync_refill_failed_groups=sync_refill_failed_groups,
                 poll_interval=poll_interval,
             )
+            if filter_groups_metric == FILTER_GROUPS_GDPO_METRIC:
+                replay_buffer_kwargs["gdpo_config"] = self._resolve_gdpo_filter_config()
             if sampler_cls is ReplayBuffer:
                 filter_groups = self.config.algorithm.get("filter_groups", None)
                 max_inflight_gen_batches = 1
@@ -198,6 +205,27 @@ class PPOTrainer(ABC):
                     max_inflight_gen_batches=max_inflight_gen_batches,
                 )
         return sampler_cls(**replay_buffer_kwargs)
+
+    def _resolve_gdpo_filter_config(self) -> dict:
+        """Forward only the GDPO settings needed by the built-in V1 filter."""
+        algorithm = self.config.algorithm
+        adv_estimator = algorithm.get("adv_estimator", None)
+        if getattr(adv_estimator, "value", adv_estimator) != "gdpo":
+            raise ValueError('algorithm.filter_groups.metric="gdpo" requires algorithm.adv_estimator="gdpo"')
+
+        reward_keys = algorithm.get("gdpo_reward_keys", None)
+        reward_weights = algorithm.get("gdpo_reward_weights", None)
+        norm_adv_by_std_in_grpo = bool(algorithm.get("norm_adv_by_std_in_grpo", True))
+        if not norm_adv_by_std_in_grpo:
+            raise ValueError(
+                "GDPO group filtering currently requires norm_adv_by_std_in_grpo=True because the "
+                "production advantage caller does not forward False (see verl-project/verl#8754)"
+            )
+        return {
+            "gdpo_reward_keys": list(reward_keys) if reward_keys is not None else None,
+            "gdpo_reward_weights": list(reward_weights) if reward_weights is not None else None,
+            "norm_adv_by_std_in_grpo": norm_adv_by_std_in_grpo,
+        }
 
     def _resolve_filter_groups_metric(self) -> str | None:
         """Resolve DAPO's group metric and verify that rollout computes it before sampling."""

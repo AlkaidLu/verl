@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import os
 import time
 from collections import Counter, defaultdict
@@ -31,6 +32,41 @@ VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DE
 
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 FILTER_GROUPS_REWARD_METRIC = "reward"
+FILTER_GROUPS_GDPO_METRIC = "gdpo"
+GDPO_FILTER_EPSILON = 1e-6
+
+
+def _gdpo_group_has_no_signal(
+    component_values: list[list[float]], reward_weights: tuple[float, ...], norm_adv_by_std_in_grpo: bool
+) -> bool:
+    """Return whether the pre-batch-whitening GDPO signal is constant within a group.
+
+    The replay buffer intentionally reuses the production GRPO normalization helper here.  It
+    keeps the filter's epsilon, FP32 arithmetic, and singleton handling aligned with the actual
+    GDPO estimator while avoiding the estimator's batch-level whitening (which is not available
+    until after sampling).
+    """
+    import torch
+
+    from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+
+    values = torch.tensor(component_values, dtype=torch.float32)
+    response_mask = torch.ones((values.shape[0], 1), dtype=torch.float32)
+    index = np.zeros(values.shape[0], dtype=np.int64)
+    aggregate = torch.zeros(values.shape[0], dtype=torch.float32)
+
+    for component_index, weight in enumerate(reward_weights):
+        component_rewards = values[:, component_index].unsqueeze(-1)
+        component_advantage, _ = compute_grpo_outcome_advantage(
+            token_level_rewards=component_rewards,
+            response_mask=response_mask,
+            index=index,
+            epsilon=GDPO_FILTER_EPSILON,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        aggregate += weight * component_advantage[:, 0]
+
+    return bool(torch.eq(aggregate, aggregate[0]).all().item())
 
 
 def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None:
@@ -97,7 +133,8 @@ class ReplayBuffer:
     ``wait``, which blocks until stale in-flight prompts finish) are only for async trainers; sync sampling
     is on-policy, so ``max_off_policy_strategy`` is a NO-OP there.
     ``DAPO`` means filtering groups whose configured reward metric is identical across all trajectories,
-             for async reward-computation path.
+             for async reward-computation path.  The opt-in ``"gdpo"`` metric instead checks the
+             group-wise, per-component GDPO signal before batch whitening.
     ``failure`` is the group status described above.
     The matrix applies to the training partition, in which ``k`` is the number of prompts to evict.
     Validation treats all terminal groups as sampleable
@@ -127,8 +164,12 @@ class ReplayBuffer:
         poll_interval (float, optional): Poll interval in seconds. Defaults to 2.0.
         refill_fn (callable, optional): Trainer-injected function that submits an exact number of fresh prompts.
         filter_groups_metric (str, optional): DAPO group-filtering metric. ``"reward"`` reads the canonical
-            pre-KL reward from ``rm_scores``; other names read each trajectory's
-            ``extra_fields.reward_extra_info``. ``None`` disables DAPO filtering.
+            pre-KL reward from ``rm_scores``; ``"gdpo"`` applies the configured per-component GDPO
+            normalization and weighted aggregation before batch whitening; other names read each
+            trajectory's ``extra_fields.reward_extra_info``. ``None`` disables DAPO filtering.
+        gdpo_config (dict, optional): The small GDPO configuration forwarded by the built-in V1
+            trainer when ``filter_groups_metric="gdpo"``. It contains ``gdpo_reward_keys``, optional
+            ``gdpo_reward_weights``, and ``norm_adv_by_std_in_grpo``.
         train_batch_size (int, optional): Prompt count represented by one Sync DAPO in-flight batch.
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
@@ -149,6 +190,7 @@ class ReplayBuffer:
         gen_batch_size: int | None = None,
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
+        gdpo_config: dict | None = None,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -158,6 +200,9 @@ class ReplayBuffer:
         self.poll_interval = poll_interval
         self.refill_fn = refill_fn
         self.filter_groups_metric = filter_groups_metric
+        self.gdpo_config = (
+            self._normalize_gdpo_config(gdpo_config) if filter_groups_metric == FILTER_GROUPS_GDPO_METRIC else None
+        )
         self.train_batch_size = train_batch_size
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
@@ -200,6 +245,49 @@ class ReplayBuffer:
                 raise ValueError("max_inflight_gen_batches must be a positive integer")
         if self.sync_refill_failed_groups and self.gen_batch_size != 1:
             raise ValueError("sync_refill_failed_groups requires gen_batch_size=1")
+
+    @staticmethod
+    def _normalize_gdpo_config(gdpo_config: dict | None) -> dict:
+        if gdpo_config is None:
+            raise ValueError('filter_groups.metric="gdpo" requires algorithm.gdpo_reward_keys and a GDPO configuration')
+
+        reward_keys = gdpo_config.get("gdpo_reward_keys")
+        if not reward_keys:
+            raise ValueError('filter_groups.metric="gdpo" requires a non-empty algorithm.gdpo_reward_keys list')
+        reward_keys = list(reward_keys)
+        if any(not isinstance(key, str) or not key for key in reward_keys):
+            raise ValueError("algorithm.gdpo_reward_keys must contain non-empty strings")
+
+        reward_weights = gdpo_config.get("gdpo_reward_weights")
+        if reward_weights is None:
+            reward_weights = [1.0] * len(reward_keys)
+        else:
+            reward_weights = list(reward_weights)
+            if len(reward_weights) != len(reward_keys):
+                raise ValueError(
+                    "algorithm.gdpo_reward_weights must have the same length as algorithm.gdpo_reward_keys"
+                )
+        try:
+            reward_weights = [float(weight) for weight in reward_weights]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("algorithm.gdpo_reward_weights must contain numeric values") from exc
+        if not all(math.isfinite(weight) for weight in reward_weights) or not any(
+            weight != 0.0 for weight in reward_weights
+        ):
+            raise ValueError("algorithm.gdpo_reward_weights must be finite and contain at least one non-zero weight")
+
+        norm_adv_by_std_in_grpo = bool(gdpo_config.get("norm_adv_by_std_in_grpo", True))
+        if not norm_adv_by_std_in_grpo:
+            raise ValueError(
+                "GDPO group filtering currently requires norm_adv_by_std_in_grpo=True because the "
+                "production advantage caller does not forward False (see verl-project/verl#8754)"
+            )
+
+        return {
+            "gdpo_reward_keys": reward_keys,
+            "gdpo_reward_weights": reward_weights,
+            "norm_adv_by_std_in_grpo": norm_adv_by_std_in_grpo,
+        }
 
     def _sync_metadata_from_transfer_queue(self):
         """Sync the metadata from TransferQueue."""
@@ -262,7 +350,7 @@ class ReplayBuffer:
             self._dapo_classification_cache[partition_id].pop(uid, None)
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
-        """Finished groups whose configured DAPO metric is identical across all trajectories.
+        """Finished groups whose configured DAPO metric has no within-group signal.
 
         Returns the filtered uids and a ``{shared_metric_value: group_count}`` breakdown built in the
         same scope, so the diagnostic (which reward level the no-signal groups collapse to) travels
@@ -279,7 +367,30 @@ class ReplayBuffer:
         new_finished_uids = finished_uids - classification_cache.keys()
         trajectory_keys = [key for key in self.partitions[partition_id] if key.split("_")[0] in new_finished_uids]
         use_canonical_reward = self.filter_groups_metric == FILTER_GROUPS_REWARD_METRIC
+        use_gdpo = self.filter_groups_metric == FILTER_GROUPS_GDPO_METRIC
+        gdpo_config = self.gdpo_config
+        if use_gdpo:
+            assert gdpo_config is not None
+            session_outputs: dict[tuple[str, str], set[str]] = defaultdict(set)
+            for key in trajectory_keys:
+                try:
+                    uid, session_id, output_index = key.rsplit("_", 2)
+                except ValueError as exc:
+                    raise RuntimeError(f"Invalid GDPO trajectory key {key!r}") from exc
+                if uid != key.split("_", 1)[0] or not session_id.isdigit() or not output_index.isdigit():
+                    raise RuntimeError(f"Invalid GDPO trajectory key {key!r}")
+                session_outputs[(uid, session_id)].add(output_index)
+            duplicate_sessions = sorted(
+                f"{uid}_{session_id}" for (uid, session_id), outputs in session_outputs.items() if len(outputs) > 1
+            )
+            if duplicate_sessions:
+                raise RuntimeError(
+                    "GDPO group filtering supports one output per session; multiple outputs found for "
+                    f"sessions {duplicate_sessions[:5]}"
+                )
         metrics_by_uid: dict[str, list[float]] = defaultdict(list)
+        gdpo_values_by_uid: dict[str, list[list[float]]] = defaultdict(list)
+        missing_gdpo_keys: dict[str, set[str]] = defaultdict(set)
         missing_metric_uids = new_finished_uids - {key.split("_")[0] for key in trajectory_keys}
 
         if trajectory_keys:
@@ -299,7 +410,20 @@ class ReplayBuffer:
             else:
                 extra_fields = getattr(value, "data", value)
                 reward_extra_info = extra_fields.get("reward_extra_info", {}) if isinstance(extra_fields, dict) else {}
-                if self.filter_groups_metric not in reward_extra_info:
+                if use_gdpo:
+                    missing_keys = [key for key in gdpo_config["gdpo_reward_keys"] if key not in reward_extra_info]
+                    if missing_keys:
+                        missing_gdpo_keys[uid].update(missing_keys)
+                    else:
+                        try:
+                            gdpo_values_by_uid[uid].append(
+                                [float(reward_extra_info[key]) for key in gdpo_config["gdpo_reward_keys"]]
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                f"GDPO reward components for finished group {uid!r} must be numeric"
+                            ) from exc
+                elif self.filter_groups_metric not in reward_extra_info:
                     missing_metric_uids.add(uid)
                 else:
                     metrics_by_uid[uid].append(float(reward_extra_info[self.filter_groups_metric]))
@@ -309,10 +433,28 @@ class ReplayBuffer:
                 f"Finished groups are missing DAPO metric {self.filter_groups_metric!r}: "
                 f"{sorted(missing_metric_uids)[:5]}"
             )
+        if missing_gdpo_keys:
+            details = {uid: sorted(keys) for uid, keys in sorted(missing_gdpo_keys.items())}
+            raise RuntimeError(f"Finished groups are missing GDPO reward component(s): {details}")
 
         for uid in new_finished_uids:
-            values = metrics_by_uid[uid]
-            classification_cache[uid] = float(values[0]) if len(values) > 1 and float(np.std(values)) == 0.0 else None
+            if use_gdpo:
+                values = gdpo_values_by_uid[uid]
+                classification_cache[uid] = (
+                    0.0
+                    if len(values) > 1
+                    and _gdpo_group_has_no_signal(
+                        values,
+                        tuple(gdpo_config["gdpo_reward_weights"]),
+                        gdpo_config["norm_adv_by_std_in_grpo"],
+                    )
+                    else None
+                )
+            else:
+                values = metrics_by_uid[uid]
+                classification_cache[uid] = (
+                    float(values[0]) if len(values) > 1 and float(np.std(values)) == 0.0 else None
+                )
 
         filtered_rewards = {uid: reward for uid, reward in classification_cache.items() if reward is not None}
         return set(filtered_rewards), Counter(filtered_rewards.values())

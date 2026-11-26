@@ -19,6 +19,7 @@ versions as ``global_steps - prompt_global_steps + 1``; ``drop`` and ``wait`` ap
 trainers.
 """
 
+import math
 import threading
 import time
 import uuid
@@ -56,6 +57,7 @@ def _make_rb(
     refill_fn=None,
     trainer_mode: str = "sync",
     filter_groups_metric: str | None = None,
+    gdpo_config: dict | None = None,
     train_batch_size: int = 2,
     gen_batch_size: int = 1,
     max_inflight_gen_batches: int = 1,
@@ -72,6 +74,7 @@ def _make_rb(
         poll_interval=poll_interval,
         refill_fn=refill_fn,
         filter_groups_metric=filter_groups_metric,
+        gdpo_config=gdpo_config,
         train_batch_size=train_batch_size,
         gen_batch_size=gen_batch_size,
         max_inflight_gen_batches=max_inflight_gen_batches,
@@ -147,6 +150,7 @@ class PromptSpec:
     global_steps: int = 0
     rewards: list[float] | None = None
     canonical_rewards: list[float | list[float]] | None = None
+    reward_extra_info: list[dict[str, float]] | None = None
     trajectory_keys: list[str] = field(default_factory=list)
 
 
@@ -166,8 +170,13 @@ class RolloutProducer(threading.Thread):
                     key = _trajectory_key(spec.uid, session_id)
                     fields = {"input_ids": torch.tensor([1, 2, 3])}
                     tag = {"is_prompt": False, "seq_len": 3, "global_steps": spec.global_steps}
+                    reward_extra_info = {}
                     if spec.rewards is not None:
-                        fields["extra_fields"] = {"reward_extra_info": {"acc": float(spec.rewards[session_id])}}
+                        reward_extra_info["acc"] = float(spec.rewards[session_id])
+                    if spec.reward_extra_info is not None:
+                        reward_extra_info.update(spec.reward_extra_info[session_id])
+                    if reward_extra_info:
+                        fields["extra_fields"] = {"reward_extra_info": reward_extra_info}
                     if spec.canonical_rewards is not None:
                         reward = spec.canonical_rewards[session_id]
                         fields["rm_scores"] = torch.tensor(
@@ -967,6 +976,229 @@ def test_dapo_reward_metric_uses_canonical_rm_scores(tq_init, partition_id):
 
         assert filtered_uids == {same_reward.uid}
         assert dict(filtered_counts) == {1.0: 1}
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_gdpo_filter_uses_component_contrast_and_keeps_sampleable_groups(tq_init, partition_id):
+    """Raw-reward ties do not hide a non-constant GDPO component signal."""
+    counterexample = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        canonical_rewards=[1.0] * 4,
+        reward_extra_info=[
+            {"component_a": 1.0, "component_b": 0.0, "component_c": 0.0},
+            {"component_a": 0.0, "component_b": 1.0, "component_c": 0.0},
+            {"component_a": 0.0, "component_b": 0.0, "component_c": 1.0},
+            {"component_a": 0.0, "component_b": 0.0, "component_c": 1.0},
+        ],
+    )
+    constant = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=3,
+        canonical_rewards=[1.0] * 3,
+        reward_extra_info=[
+            {"component_a": 1.0, "component_b": 2.0, "component_c": 3.0},
+            {"component_a": 1.0, "component_b": 2.0, "component_c": 3.0},
+            {"component_a": 1.0, "component_b": 2.0, "component_c": 3.0},
+        ],
+    )
+    cancellation = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        canonical_rewards=[1.0] * 4,
+        reward_extra_info=[
+            {"component_a": 1.0, "component_b": 1.0, "component_c": 0.0},
+            {"component_a": 0.0, "component_b": 0.0, "component_c": 0.0},
+            {"component_a": 1.0, "component_b": 1.0, "component_c": 0.0},
+            {"component_a": 0.0, "component_b": 0.0, "component_c": 0.0},
+        ],
+    )
+    _produce(partition_id, [counterexample, constant, cancellation]).join_and_check()
+
+    gdpo_config = {
+        "gdpo_reward_keys": ["component_a", "component_b", "component_c"],
+        "gdpo_reward_weights": [1.0, -1.0, 1.0],
+        "norm_adv_by_std_in_grpo": True,
+    }
+    rb = _make_rb(filter_groups_metric="gdpo", gdpo_config=gdpo_config, refill_fn=lambda _n: None)
+    raw_reward_rb = _make_rb(filter_groups_metric="reward", refill_fn=lambda _n: None)
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        filtered_uids, filtered_counts = rb._dapo_filtered_keys(partition_id)
+        assert filtered_uids == {constant.uid, cancellation.uid}
+        assert dict(filtered_counts) == {0.0: 2}
+        validation_filtered_uids, validation_counts = rb._dapo_filtered_keys("val")
+        assert validation_filtered_uids == set()
+        assert not validation_counts
+
+        # The production per-component GRPO helper gives the counterexample a non-constant signal.
+        from verl.trainer.ppo.core_algos import compute_gdpo_outcome_advantage, compute_grpo_outcome_advantage
+
+        values = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        response_mask = torch.ones((4, 1), dtype=torch.float32)
+        component_signals = [
+            compute_grpo_outcome_advantage(values[:, i : i + 1], response_mask, [0, 0, 0, 0])[0][:, 0]
+            for i in range(values.shape[1])
+        ]
+        gdpo_signal = sum(component_signals)
+        assert float(torch.std(gdpo_signal).item()) > 0.0
+
+        estimator_config = {**gdpo_config, "gdpo_reward_weights": [1.0, 1.0, 1.0]}
+        estimator_advantage, _ = compute_gdpo_outcome_advantage(
+            token_level_rewards=torch.zeros((4, 2), dtype=torch.float32),
+            response_mask=response_mask.expand(-1, 2),
+            index=[0, 0, 0, 0],
+            config=estimator_config,
+            non_tensor_batch={
+                "component_a": values[:, 0].tolist(),
+                "component_b": values[:, 1].tolist(),
+                "component_c": values[:, 2].tolist(),
+            },
+            batch={
+                "prompts": torch.ones((4, 1), dtype=torch.long),
+                "attention_mask": torch.ones((4, 2), dtype=torch.long),
+            },
+        )
+        assert torch.sign(estimator_advantage[:, 0]).tolist() == [1.0, 1.0, -1.0, -1.0]
+
+        raw_reward_rb._sync_metadata_from_transfer_queue()
+        raw_filtered_uids, _ = raw_reward_rb._dapo_filtered_keys(partition_id)
+        assert raw_filtered_uids == {counterexample.uid, constant.uid, cancellation.uid}
+
+        batch, _ = rb.sample(global_steps=0, partition_id=partition_id, batch_size=1)
+        assert _uids_of(batch.keys) == {counterexample.uid}
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_gdpo_filter_respects_weights_normalization_and_singletons(tq_init, partition_id):
+    zero_weight = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        reward_extra_info=[
+            {"component_a": 1.0, "component_b": 0.0},
+            {"component_a": 0.0, "component_b": 0.0},
+            {"component_a": 1.0, "component_b": 0.0},
+            {"component_a": 0.0, "component_b": 0.0},
+        ],
+    )
+    singleton = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=1,
+        reward_extra_info=[{"component_a": 3.0, "component_b": 4.0}],
+    )
+    _produce(partition_id, [zero_weight, singleton]).join_and_check()
+
+    config = {
+        "gdpo_reward_keys": ["component_a", "component_b"],
+        "gdpo_reward_weights": [0.0, 1.0],
+        "norm_adv_by_std_in_grpo": True,
+    }
+    rb = _make_rb(filter_groups_metric="gdpo", gdpo_config=config, refill_fn=lambda _n: None)
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        filtered_uids, _ = rb._dapo_filtered_keys(partition_id)
+        assert filtered_uids == {zero_weight.uid}
+        assert singleton.uid not in filtered_uids
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_gdpo_filter_rejects_normoff_and_invalid_weights(tq_init, partition_id):
+    with pytest.raises(ValueError, match="requires norm_adv_by_std_in_grpo=True"):
+        _make_rb(
+            filter_groups_metric="gdpo",
+            gdpo_config={
+                "gdpo_reward_keys": ["component_a", "component_b"],
+                "gdpo_reward_weights": [1.0, 1.0],
+                "norm_adv_by_std_in_grpo": False,
+            },
+            refill_fn=lambda _n: None,
+        )
+
+    with pytest.raises(ValueError, match="same length"):
+        _make_rb(
+            filter_groups_metric="gdpo",
+            gdpo_config={"gdpo_reward_keys": ["component_a", "component_b"], "gdpo_reward_weights": [1.0]},
+            refill_fn=lambda _n: None,
+        )
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [[math.nan, 1.0], [math.inf, 1.0], [0.0, 0.0]],
+    ids=["nan", "inf", "allzero"],
+)
+def test_gdpo_filter_rejects_nonfinite_or_allzero_weights(tq_init, partition_id, weights):
+    with pytest.raises(ValueError, match="finite and contain at least one non-zero"):
+        _make_rb(
+            filter_groups_metric="gdpo",
+            gdpo_config={"gdpo_reward_keys": ["component_a", "component_b"], "gdpo_reward_weights": weights},
+            refill_fn=lambda _n: None,
+        )
+
+
+def test_gdpo_filter_reports_missing_component(tq_init, partition_id):
+    missing = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=2,
+        reward_extra_info=[{"component_a": 1.0}, {"component_a": 0.0, "component_b": 1.0}],
+    )
+    _produce(partition_id, [missing]).join_and_check()
+    rb = _make_rb(
+        filter_groups_metric="gdpo",
+        gdpo_config={"gdpo_reward_keys": ["component_a", "component_b"]},
+        refill_fn=lambda _n: None,
+    )
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        with pytest.raises(RuntimeError, match="missing GDPO reward component"):
+            rb._dapo_filtered_keys(partition_id)
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_gdpo_filter_fails_closed_for_multiple_outputs_in_one_session(tq_init, partition_id):
+    spec = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=1,
+        reward_extra_info=[{"component_a": 1.0, "component_b": 0.0}],
+    )
+    _produce(partition_id, [spec]).join_and_check()
+    tq.kv_put(
+        key=_trajectory_key(spec.uid, session_id=0, index=1),
+        partition_id=partition_id,
+        fields={
+            "input_ids": torch.tensor([1, 2, 3]),
+            "extra_fields": {"reward_extra_info": {"component_a": 0.0, "component_b": 1.0}},
+        },
+        tag={"is_prompt": False, "seq_len": 3, "global_steps": spec.global_steps},
+    )
+    rb = _make_rb(
+        filter_groups_metric="gdpo",
+        gdpo_config={"gdpo_reward_keys": ["component_a", "component_b"]},
+        refill_fn=lambda _n: None,
+    )
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        with pytest.raises(RuntimeError, match="one output per session"):
+            rb._dapo_filtered_keys(partition_id)
     finally:
         _clear_partition(partition_id)
 
